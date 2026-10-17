@@ -47,6 +47,27 @@ export interface TokenMetadata {
 }
 
 /**
+ * Options for {@link StreamsClient.listStreams}, which reconstructs the streams
+ * involving an address by scanning the contract's `("stream", "created", id)`
+ * events until a real indexer exists.
+ */
+export interface ListStreamsOptions {
+  /** Address (`G...` account or `C...` contract) to find streams for. */
+  address: string;
+  /** First ledger to scan, inclusive. Event retention is bounded, so this is required. */
+  startLedger: number;
+  /**
+   * Last ledger to scan, inclusive. Defaults to the chain tip reported when the
+   * scan starts, so a long scan does not chase a moving head.
+   */
+  endLedger?: number;
+  /** Events requested per `getEvents` page. Defaults to 100. */
+  pageSize?: number;
+  /** Upper bound on `getEvents` pages fetched per call. Defaults to 50. */
+  maxPages?: number;
+}
+
+/**
  * The Stellar Asset Contract id for a classic asset (`'native'` for XLM, or
  * `CODE:ISSUER` / an `Asset`) on the given network. Use it as the `token` of a
  * stream when streaming an issued asset.
@@ -78,6 +99,12 @@ const MAX_BACKOFF_MS = 8_000;
 const MAX_LABEL_BYTES = 64;
 /** Must match `MAX_REFERENCE_LEN` in the stream contract. */
 const MAX_REFERENCE_BYTES = 128;
+/** Default events requested per `getEvents` page in {@link StreamsClient.listStreams}. */
+const DEFAULT_LIST_PAGE_SIZE = 100;
+/** Default cap on `getEvents` pages fetched by one {@link StreamsClient.listStreams} call. */
+const DEFAULT_MAX_LIST_PAGES = 50;
+/** The `("stream", "created", <id>)` topic row a `getEvents` filter matches on. */
+const STREAM_CREATED_TOPICS = ['stream', 'created', ''] as string[];
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -381,6 +408,84 @@ export class StreamsClient {
     return raw ? normalizeStream(raw) : null;
   }
 
+  /**
+   * Lists the streams where `address` is the sender or the recipient by paging
+   * through the contract's `("stream", "created", id)` events with `getEvents`,
+   * then fetching each matching id with {@link StreamsClient.getStream}.
+   *
+   * This is a stop-gap until a real indexer exists: the scan is bounded by the
+   * RPC node's event retention, so `startLedger` must fall inside it. The ledger
+   * range and page size are configurable (see {@link ListStreamsOptions}); when
+   * `endLedger` is omitted the chain tip is frozen at the value reported by the
+   * first page, and results are deduplicated and ordered by first creation.
+   *
+   * @throws if `address` is not a `G...`/`C...` key or `startLedger` is not a
+   *   non-negative integer, before any request is made.
+   */
+  async listStreams(options: ListStreamsOptions): Promise<Stream[]> {
+    const { address, startLedger } = options;
+    if (!StrKey.isValidEd25519PublicKey(address) && !StrKey.isValidContract(address)) {
+      throw new Error(
+        `Invalid address: ${address}. Expected a G... account address or C... contract address.`,
+      );
+    }
+    if (!Number.isInteger(startLedger) || startLedger < 0) {
+      throw new Error(`Invalid startLedger: ${startLedger}. Expected a non-negative integer.`);
+    }
+
+    const pageSize = options.pageSize ?? DEFAULT_LIST_PAGE_SIZE;
+    const maxPages = options.maxPages ?? DEFAULT_MAX_LIST_PAGES;
+    const filters = [
+      {
+        type: 'contract' as const,
+        contractIds: [this.contractId],
+        topics: [STREAM_CREATED_TOPICS],
+      },
+    ];
+
+    // Collected in creation order; a stream id is emitted once but paging can
+    // overlap, so a Set keeps the result stable and free of duplicates.
+    const ids = new Set<string>();
+    let cursor: string | undefined;
+    let endLedger = options.endLedger;
+
+    for (let page = 0; page < maxPages; page++) {
+      // The API forbids mixing `startLedger` with `cursor`, so the first page
+      // bounds the scan by ledger range and every later page resumes by cursor.
+      const request =
+        cursor === undefined
+          ? { filters, startLedger, endLedger, limit: pageSize }
+          : { filters, cursor, limit: pageSize };
+      const response = await this.server.getEvents(request);
+
+      // Freeze the tip on the first page so a long scan does not drift forward.
+      if (cursor === undefined && endLedger === undefined) {
+        endLedger = response.latestLedger;
+      }
+
+      let scrolledPastWindow = false;
+      for (const event of response.events) {
+        // Cursor pages are not bounded by `endLedger`, so drop anything past it.
+        if (endLedger !== undefined && event.ledger > endLedger) {
+          scrolledPastWindow = true;
+          continue;
+        }
+        const created = decodeCreatedEvent(event);
+        if (!created) continue;
+        if (created.sender !== address && created.recipient !== address) continue;
+        ids.add(created.id);
+      }
+
+      cursor = response.cursor;
+      // A short page means the range is exhausted; a page that ran past the
+      // frozen tip means the same. Either way, stop requesting.
+      if (response.events.length < pageSize || scrolledPastWindow) break;
+    }
+
+    const fetched = await Promise.all([...ids].map((id) => this.getStream(id)));
+    return fetched.filter((stream): stream is Stream => stream !== null);
+  }
+
   /** Fetch protocol configuration. Returns `null` if the contract is uninitialized. */
   async getConfig(): Promise<StreamConfig | null> {
     const raw = (await this.simulate('get_config')) as RawConfig | null;
@@ -508,6 +613,40 @@ function normalizeStream(raw: RawStream): Stream {
     reference: raw.reference,
     cancelled: raw.cancelled,
   };
+}
+
+/**
+ * Decodes a `("stream", "created", <id>)` contract event into its stream id and
+ * the sender/recipient published in its data. Returns `null` for any event that
+ * is not a well-formed `created` event, so a scan skips unrelated or
+ * undecodable events rather than failing.
+ */
+function decodeCreatedEvent(
+  event: SorobanRpc.Api.EventResponse,
+): { id: string; sender: string; recipient: string } | null {
+  const [streamTopic, createdTopic, idTopic] = event.topic;
+  if (
+    !streamTopic ||
+    !createdTopic ||
+    !idTopic ||
+    streamTopic.switch().name !== 'scvSymbol' ||
+    createdTopic.switch().name !== 'scvSymbol' ||
+    streamTopic.sym().toString() !== 'stream' ||
+    createdTopic.sym().toString() !== 'created'
+  ) {
+    return null;
+  }
+  try {
+    const id = scValToNative(idTopic);
+    const data = scValToNative(event.value);
+    if (typeof id !== 'bigint' || !Array.isArray(data) || data.length < 2) {
+      return null;
+    }
+    return { id: id.toString(), sender: String(data[0]), recipient: String(data[1]) };
+  } catch {
+    // Undecodable events are skipped, never fatal to a scan.
+    return null;
+  }
 }
 
 function assertTokenId(tokenId: string): void {

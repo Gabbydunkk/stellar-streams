@@ -24,6 +24,7 @@ export function mockRpc() {
     .mockImplementation(async (tx) => tx as Awaited<ReturnType<typeof proto.prepareTransaction>>);
   const sendTransaction = vi.spyOn(proto, 'sendTransaction');
   const getTransaction = vi.spyOn(proto, 'getTransaction');
+  const getEvents = vi.spyOn(proto, 'getEvents');
 
   const all = [
     getAccount,
@@ -31,6 +32,7 @@ export function mockRpc() {
     prepareTransaction,
     sendTransaction,
     getTransaction,
+    getEvents,
   ];
   return {
     getAccount,
@@ -38,6 +40,7 @@ export function mockRpc() {
     prepareTransaction,
     sendTransaction,
     getTransaction,
+    getEvents,
     calls: () => all.reduce((sum, spy) => sum + spy.mock.calls.length, 0),
     reset: () => all.forEach((spy) => spy.mockClear()),
   };
@@ -186,4 +189,50 @@ export function simulateByMethod(results: Record<string, xdr.ScVal>) {
     if (!retval) throw new Error(`Unexpected simulation of ${method}`);
     return simulationSuccess(retval);
   };
+}
+
+/**
+ * A parsed `("stream", "created", id)` event as `getEvents` returns it: the id
+ * in the third topic and `(sender, recipient, amount)` in the value.
+ */
+export function createdEvent(
+  id: bigint | number,
+  sender: string,
+  recipient: string,
+  extra: { ledger?: number; contractId?: string } = {},
+): SorobanRpc.Api.EventResponse {
+  return {
+    id: `0000000${extra.ledger ?? 0}`,
+    type: 'contract',
+    ledger: extra.ledger ?? 0,
+    ledgerClosedAt: '2025-01-01T00:00:00Z',
+    transactionIndex: 0,
+    operationIndex: 0,
+    contractId: extra.contractId ?? CONTRACT_ID,
+    inSuccessfulContractCall: true,
+    txHash: 'a'.repeat(64),
+    topic: [
+      xdr.ScVal.scvSymbol('stream'),
+      xdr.ScVal.scvSymbol('created'),
+      nativeToScVal(BigInt(id), { type: 'u64' }),
+    ],
+    value: nativeToScVal([sender, recipient, 1_000n], {
+      type: ['address', 'address', 'i128'],
+    }),
+  } as unknown as SorobanRpc.Api.EventResponse;
+}
+
+/** A `getEvents` page carrying `events`, with a cursor and ledger bookends. */
+export function eventsResponse(
+  events: SorobanRpc.Api.EventResponse[],
+  extra: { cursor?: string; latestLedger?: number; oldestLedger?: number } = {},
+): SorobanRpc.Api.GetEventsResponse {
+  return {
+    events,
+    cursor: extra.cursor ?? '',
+    latestLedger: extra.latestLedger ?? 1_000,
+    oldestLedger: extra.oldestLedger ?? 0,
+    latestLedgerCloseTime: '2025-01-01T00:00:00Z',
+    oldestLedgerCloseTime: '2025-01-01T00:00:00Z',
+  } as unknown as SorobanRpc.Api.GetEventsResponse;
 }
