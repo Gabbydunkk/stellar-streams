@@ -28,6 +28,44 @@ export interface WriteOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * Options for constructing a {@link StreamsClient}: where the `stream`
+ * contract lives, how to reach Soroban RPC, and which account signs writes.
+ *
+ * Only `contractId`, `rpcUrl` and `networkPassphrase` are required. Reads work
+ * with just those three plus a `publicKey`; every write additionally needs
+ * `signTransaction`.
+ *
+ * @example
+ * ```typescript
+ * import { StreamsClient } from '@stellar-starter-kit/sdk';
+ *
+ * const client = new StreamsClient({
+ *   contractId: process.env.NEXT_PUBLIC_STREAM_CONTRACT_ID!,
+ *   rpcUrl: 'https://soroban-testnet.stellar.org',
+ *   networkPassphrase: 'Test SDF Network ; September 2015',
+ *   publicKey: address,
+ *   signTransaction: (txXdr) => wallet.signTransaction(txXdr),
+ * });
+ * ```
+ *
+ * @example
+ * ```typescript
+ * // Simulated locally before a real submit is expensive (e.g. a batch of
+ * // `createStream` calls already covered by one simulation): skip it, and
+ * // accept that contract errors only surface once the transaction is sent.
+ * const fastClient = new StreamsClient({
+ *   contractId,
+ *   rpcUrl,
+ *   networkPassphrase,
+ *   publicKey: address,
+ *   signTransaction,
+ *   skipSimulation: true,
+ *   pollIntervalMs: 500,
+ *   pollTimeoutMs: 60_000,
+ * });
+ * ```
+ */
 export interface StreamsClientOptions {
   /** The deployed contract id (C...): the `stream` contract for `StreamsClient`, the `escrow` contract for `EscrowClient`. */
   contractId: string;
@@ -75,7 +113,23 @@ export interface StreamsTransport {
   getTransaction(hash: string): Promise<SorobanRpc.Api.GetTransactionResponse>;
 }
 
-/** On-chain metadata of a SEP-41 token contract (any SAC or custom Soroban token). */
+/**
+ * On-chain metadata of a SEP-41 token contract (any SAC or custom Soroban
+ * token), as returned by {@link StreamsClient.getTokenMetadata}.
+ *
+ * Scale and display token amounts with `decimals` from the token itself — only
+ * SACs (XLM and issued assets) are guaranteed to use 7.
+ *
+ * @example
+ * ```typescript
+ * import { formatTokenAmount } from '@stellar-starter-kit/utils';
+ *
+ * const meta: TokenMetadata = await client.getTokenMetadata(token);
+ * // meta => { contractId: 'C…', decimals: 7, symbol: 'USDC' }
+ * const human = formatTokenAmount(stream.claimable, meta.decimals);
+ * console.log(`${human} ${meta.symbol}`);
+ * ```
+ */
 export interface TokenMetadata {
   contractId: string;
   /** Decimal places of the smallest unit. Read from the token; never assume 7. */
@@ -87,6 +141,22 @@ export interface TokenMetadata {
  * The Stellar Asset Contract id for a classic asset (`'native'` for XLM, or
  * `CODE:ISSUER` / an `Asset`) on the given network. Use it as the `token` of a
  * stream when streaming an issued asset.
+ *
+ * @param asset - `'native'`, a `CODE:ISSUER` string, or an `Asset` instance
+ *   from `@stellar/stellar-sdk`.
+ * @param networkPassphrase - Passphrase of the network the asset exists on,
+ *   e.g. `'Test SDF Network ; September 2015'`.
+ * @returns The SAC contract id (`C...`) for that asset on that network.
+ * @throws Error when a string is neither `'native'` nor a `CODE:ISSUER` pair.
+ * @example
+ * ```typescript
+ * import { assetContractId } from '@stellar-starter-kit/sdk';
+ *
+ * const XLM = assetContractId('native', 'Test SDF Network ; September 2015');
+ * const USDC = assetContractId(`USDC:${usdcIssuer}`, 'Test SDF Network ; September 2015');
+ * // Pass the result straight to createStream:
+ * await client.createStream({ sender, recipient, token: USDC, amount, startTime, endTime, cliffTime });
+ * ```
  */
 export function assetContractId(
   asset: Asset | 'native' | string,
@@ -155,7 +225,31 @@ function throwIfAborted(signal?: AbortSignal): void {
 /** Raised when the network rejects a submission because its sequence number is stale. */
 class StaleSequenceError extends Error {}
 
-/** Stable identifiers for the stream contract's `StreamError` enum. */
+/**
+ * Stable identifiers for the stream contract's `StreamError` enum, carried on
+ * {@link StreamsError.code} so UI code can branch on a name instead of a
+ * message. Codes outside this table leave `code` `undefined` and keep the raw
+ * diagnostics in `message`.
+ *
+ * @example
+ * ```typescript
+ * import { StreamsError, type StreamErrorCode } from '@stellar-starter-kit/sdk';
+ *
+ * const COPY: Partial<Record<StreamErrorCode, string>> = {
+ *   NOTHING_TO_WITHDRAW: 'Nothing has vested yet — check the schedule.',
+ *   STREAM_NOT_FOUND: 'This stream no longer exists.',
+ *   UNAUTHORIZED: 'Only the recipient can withdraw a stream.',
+ * };
+ *
+ * try {
+ *   await client.withdraw(id);
+ * } catch (error) {
+ *   if (error instanceof StreamsError && error.code) {
+ *     console.error(COPY[error.code] ?? error.message);
+ *   }
+ * }
+ * ```
+ */
 export type StreamErrorCode =
   | 'INVALID_AMOUNT'
   | 'INVALID_TIME_RANGE'
@@ -173,7 +267,21 @@ export type StreamErrorCode =
   | 'BATCH_TOO_LARGE'
   | 'BATCH_OVERFLOW';
 
-/** Stable identifiers for the splits contract's `SplitError` enum. */
+/**
+ * Stable identifiers for the splits contract's `SplitError` enum. They share
+ * the numeric-code space of the `splits` contract, so they are listed
+ * separately from {@link StreamErrorCode}; the SDK currently maps stream
+ * contract failures onto {@link StreamsError.code}, and these names are what a
+ * caller should compare decoded `splits` diagnostics against.
+ *
+ * @example
+ * ```typescript
+ * import type { SplitErrorCode } from '@stellar-starter-kit/sdk';
+ *
+ * const isRecipientsProblem = (code: SplitErrorCode) =>
+ *   code === 'EmptyRecipients' || code === 'LengthMismatch' || code === 'DuplicateRecipient';
+ * ```
+ */
 export type SplitErrorCode =
   | 'EmptyRecipients'
   | 'LengthMismatch'
@@ -213,6 +321,26 @@ const STREAM_ERROR_CODES: Record<number, StreamErrorCode> = {
  * that survives contract redeploys; `contractCode` is the raw numeric code.
  * Both are undefined when the failure is not a known contract error, in which
  * case `message` carries the raw diagnostics.
+ *
+ * Thrown by every {@link StreamsClient} method that reaches the contract:
+ * reads from the pre-flight simulation, writes from the simulation *and* from
+ * submission / confirmation polling.
+ *
+ * @example
+ * ```typescript
+ * import { StreamsError } from '@stellar-starter-kit/sdk';
+ *
+ * try {
+ *   await client.withdraw(streamId);
+ * } catch (error) {
+ *   if (error instanceof StreamsError) {
+ *     error.name;          // 'StreamsError'
+ *     error.code;          // e.g. 'NOTHING_TO_WITHDRAW', or undefined
+ *     error.contractCode;  // e.g. 5 — the raw `StreamError` enum value
+ *     error.message;       // includes the contract diagnostics
+ *   }
+ * }
+ * ```
  */
 export class StreamsError extends Error {
   /** Stable identifier for the contract error, e.g. `STREAM_NOT_FOUND`. */
@@ -220,6 +348,19 @@ export class StreamsError extends Error {
   /** The raw numeric code from the contract's `StreamError` enum. */
   readonly contractCode?: number;
 
+  /**
+   * @param message - Human-readable failure text, always including the raw
+   *   simulation or submission diagnostics.
+   * @param contractCode - Numeric `StreamError` value decoded from those
+   *   diagnostics; omit it when the failure is not a contract error.
+   * @example
+   * ```typescript
+   * const known = new StreamsError('Simulation of withdraw failed: Error(Contract, #5)', 5);
+   * known.code; // 'NOTHING_TO_WITHDRAW'
+   * const unknown = new StreamsError('Simulation of get_stream failed: HostError(sceBuiltin)');
+   * unknown.code; // undefined — the message stays untouched
+   * ```
+   */
   constructor(message: string, contractCode?: number) {
     super(message);
     this.name = 'StreamsError';
