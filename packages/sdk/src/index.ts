@@ -740,8 +740,7 @@ export class StreamsClient extends SorobanClient {
 
   /**
    * Fetch a stream by id, decoded from the contract's `Stream` struct into the
-   * camelCase {@link Stream} shape (`u64`/`i128` fields arrive as decimal
-   * strings).
+   * camelCase `Stream` shape (`u64`/`i128` fields arrive as decimal strings).
    *
    * @param id - Stream id as `bigint`, `number`, or decimal string.
    * @returns The stream, or `null` when no stream with that id exists.
