@@ -47,6 +47,16 @@ export class FakeTransport implements StreamsTransport {
     throw new Error('getTransaction was not scripted for this test');
   });
 
+  readonly getLatestLedger = vi.fn<StreamsTransport['getLatestLedger']>(async () => ({
+    id: 'ledger-hash',
+    sequence: LATEST_LEDGER,
+    protocolVersion: '22',
+  }));
+
+  readonly getEvents = vi.fn<StreamsTransport['getEvents']>(async () => {
+    throw new Error('getEvents was not scripted for this test');
+  });
+
   /** How many RPC round trips have been made through this transport in total. */
   calls(): number {
     return TRANSPORT_METHODS.reduce((sum, method) => sum + this[method].mock.calls.length, 0);
@@ -64,6 +74,8 @@ const TRANSPORT_METHODS = [
   'prepareTransaction',
   'sendTransaction',
   'getTransaction',
+  'getLatestLedger',
+  'getEvents',
 ] as const;
 
 export function fakeTransport(): FakeTransport {

@@ -99,8 +99,14 @@ export interface StreamsTransport {
   getAccount(address: string): Promise<Account>;
   simulateTransaction(tx: Transaction): Promise<SorobanRpc.Api.SimulateTransactionResponse>;
   prepareTransaction(tx: Transaction): Promise<Transaction>;
-  sendTransaction(tx: Transaction | FeeBumpTransaction): Promise<SorobanRpc.Api.SendTransactionResponse>;
+  sendTransaction(
+    tx: Transaction | FeeBumpTransaction,
+  ): Promise<SorobanRpc.Api.SendTransactionResponse>;
   getTransaction(hash: string): Promise<SorobanRpc.Api.GetTransactionResponse>;
+  /** Chain tip, used by `listStreams` to anchor its default ledger window. */
+  getLatestLedger(): Promise<SorobanRpc.Api.GetLatestLedgerResponse>;
+  /** Contract event scan, the transport `listStreams` pages through. */
+  getEvents(request: SorobanRpc.Api.GetEventsRequest): Promise<SorobanRpc.Api.GetEventsResponse>;
 }
 
 /** On-chain metadata of a SEP-41 token contract (any SAC or custom Soroban token). */
@@ -497,10 +503,7 @@ abstract class SorobanClient {
 
       let hash: string;
       try {
-        hash = await this.submit(
-          this.options.feeBump ? await this.bumpFees(inner) : inner,
-          signal,
-        );
+        hash = await this.submit(this.options.feeBump ? await this.bumpFees(inner) : inner, signal);
       } catch (error) {
         this.invalidateAccount();
         if (error instanceof StaleSequenceError && attempt === 0) continue;
@@ -730,7 +733,7 @@ export class StreamsClient extends SorobanClient {
     if (startLedger === undefined) {
       // Anchor the default window on the node's own tip: that is the only
       // reference guaranteed to keep the scan inside its event retention.
-      const { sequence } = await this.server.getLatestLedger();
+      const { sequence } = await this.transport.getLatestLedger();
       startLedger = Math.max(1, sequence - DEFAULT_EVENT_LOOKBACK_LEDGERS);
       if (endLedger === undefined) endLedger = sequence;
     }
@@ -765,7 +768,7 @@ export class StreamsClient extends SorobanClient {
     // Soroban RPC rejects a getEvents request that mixes a cursor with a ledger
     // range, so the scan opens in ledger mode and continues from the returned
     // cursor, honouring endLedger on this side of the wire instead.
-    let page = await this.server.getEvents({
+    let page = await this.transport.getEvents({
       filters,
       startLedger,
       ...(endLedger === undefined ? {} : { endLedger }),
@@ -777,7 +780,7 @@ export class StreamsClient extends SorobanClient {
       // runs cannot appear on a later page and shift the end from under it.
       if (endLedger === undefined) endLedger = page.latestLedger;
       if (page.events.length === 0 || !page.cursor) break;
-      page = await this.server.getEvents({ filters, cursor: page.cursor, limit: pageSize });
+      page = await this.transport.getEvents({ filters, cursor: page.cursor, limit: pageSize });
     }
 
     const streams: Stream[] = [];
