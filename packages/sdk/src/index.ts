@@ -12,7 +12,9 @@ import {
   xdr,
 } from '@stellar/stellar-sdk';
 import * as SorobanRpc from '@stellar/stellar-sdk/rpc';
-import { decodeStreamEvent } from './events';
+// Explicit extension: tsc keeps this specifier as written in dist, and Node's
+// ESM resolver will not load a directory, so the published entry fails without it.
+import { decodeStreamEvent } from './events.js';
 // Type-only: the SDK never imports another workspace package at runtime, so
 // its tests run in CI's `test` job straight off a checkout with no build step.
 import type {
