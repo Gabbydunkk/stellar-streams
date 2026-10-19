@@ -19,10 +19,11 @@ import type {
   CreateEscrowParams,
   CreateStreamParams,
   Escrow,
-  EscrowStatus,
   Stream,
   StreamConfig,
 } from '@stellar-starter-kit/types';
+import { normalizeEscrow, normalizeStream } from '@stellar-starter-kit/types';
+import type { RawEscrow, RawStream } from '@stellar-starter-kit/types';
 
 /** Options for changing an operation from outside, e.g. cancelling it when a page unmounts. */
 export interface WriteOptions {
@@ -30,6 +31,44 @@ export interface WriteOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * Options for constructing a {@link StreamsClient}: where the `stream`
+ * contract lives, how to reach Soroban RPC, and which account signs writes.
+ *
+ * Only `contractId`, `rpcUrl` and `networkPassphrase` are required. Reads work
+ * with just those three plus a `publicKey`; every write additionally needs
+ * `signTransaction`.
+ *
+ * @example
+ * ```typescript
+ * import { StreamsClient } from '@stellar-starter-kit/sdk';
+ *
+ * const client = new StreamsClient({
+ *   contractId: process.env.NEXT_PUBLIC_STREAM_CONTRACT_ID!,
+ *   rpcUrl: 'https://soroban-testnet.stellar.org',
+ *   networkPassphrase: 'Test SDF Network ; September 2015',
+ *   publicKey: address,
+ *   signTransaction: (txXdr) => wallet.signTransaction(txXdr),
+ * });
+ * ```
+ *
+ * @example
+ * ```typescript
+ * // Simulated locally before a real submit is expensive (e.g. a batch of
+ * // `createStream` calls already covered by one simulation): skip it, and
+ * // accept that contract errors only surface once the transaction is sent.
+ * const fastClient = new StreamsClient({
+ *   contractId,
+ *   rpcUrl,
+ *   networkPassphrase,
+ *   publicKey: address,
+ *   signTransaction,
+ *   skipSimulation: true,
+ *   pollIntervalMs: 500,
+ *   pollTimeoutMs: 60_000,
+ * });
+ * ```
+ */
 export interface StreamsClientOptions {
   /** The deployed contract id (C...): the `stream` contract for `StreamsClient`, the `escrow` contract for `EscrowClient`. */
   contractId: string;
@@ -109,7 +148,23 @@ export interface StreamsTransport {
   getEvents(request: SorobanRpc.Api.GetEventsRequest): Promise<SorobanRpc.Api.GetEventsResponse>;
 }
 
-/** On-chain metadata of a SEP-41 token contract (any SAC or custom Soroban token). */
+/**
+ * On-chain metadata of a SEP-41 token contract (any SAC or custom Soroban
+ * token), as returned by {@link StreamsClient.getTokenMetadata}.
+ *
+ * Scale and display token amounts with `decimals` from the token itself — only
+ * SACs (XLM and issued assets) are guaranteed to use 7.
+ *
+ * @example
+ * ```typescript
+ * import { formatTokenAmount } from '@stellar-starter-kit/utils';
+ *
+ * const meta: TokenMetadata = await client.getTokenMetadata(token);
+ * // meta => { contractId: 'C…', decimals: 7, symbol: 'USDC' }
+ * const human = formatTokenAmount(stream.claimable, meta.decimals);
+ * console.log(`${human} ${meta.symbol}`);
+ * ```
+ */
 export interface TokenMetadata {
   contractId: string;
   /** Decimal places of the smallest unit. Read from the token; never assume 7. */
@@ -121,6 +176,22 @@ export interface TokenMetadata {
  * The Stellar Asset Contract id for a classic asset (`'native'` for XLM, or
  * `CODE:ISSUER` / an `Asset`) on the given network. Use it as the `token` of a
  * stream when streaming an issued asset.
+ *
+ * @param asset - `'native'`, a `CODE:ISSUER` string, or an `Asset` instance
+ *   from `@stellar/stellar-sdk`.
+ * @param networkPassphrase - Passphrase of the network the asset exists on,
+ *   e.g. `'Test SDF Network ; September 2015'`.
+ * @returns The SAC contract id (`C...`) for that asset on that network.
+ * @throws Error when a string is neither `'native'` nor a `CODE:ISSUER` pair.
+ * @example
+ * ```typescript
+ * import { assetContractId } from '@stellar-starter-kit/sdk';
+ *
+ * const XLM = assetContractId('native', 'Test SDF Network ; September 2015');
+ * const USDC = assetContractId(`USDC:${usdcIssuer}`, 'Test SDF Network ; September 2015');
+ * // Pass the result straight to createStream:
+ * await client.createStream({ sender, recipient, token: USDC, amount, startTime, endTime, cliffTime });
+ * ```
  */
 export function assetContractId(
   asset: Asset | 'native' | string,
@@ -196,7 +267,31 @@ function ceilDiv(total: bigint, parts: bigint): bigint {
 /** Raised when the network rejects a submission because its sequence number is stale. */
 class StaleSequenceError extends Error {}
 
-/** Stable identifiers for the stream contract's `StreamError` enum. */
+/**
+ * Stable identifiers for the stream contract's `StreamError` enum, carried on
+ * {@link StreamsError.code} so UI code can branch on a name instead of a
+ * message. Codes outside this table leave `code` `undefined` and keep the raw
+ * diagnostics in `message`.
+ *
+ * @example
+ * ```typescript
+ * import { StreamsError, type StreamErrorCode } from '@stellar-starter-kit/sdk';
+ *
+ * const COPY: Partial<Record<StreamErrorCode, string>> = {
+ *   NOTHING_TO_WITHDRAW: 'Nothing has vested yet — check the schedule.',
+ *   STREAM_NOT_FOUND: 'This stream no longer exists.',
+ *   UNAUTHORIZED: 'Only the recipient can withdraw a stream.',
+ * };
+ *
+ * try {
+ *   await client.withdraw(id);
+ * } catch (error) {
+ *   if (error instanceof StreamsError && error.code) {
+ *     console.error(COPY[error.code] ?? error.message);
+ *   }
+ * }
+ * ```
+ */
 export type StreamErrorCode =
   | 'INVALID_AMOUNT'
   | 'INVALID_TIME_RANGE'
@@ -214,7 +309,21 @@ export type StreamErrorCode =
   | 'BATCH_TOO_LARGE'
   | 'BATCH_OVERFLOW';
 
-/** Stable identifiers for the splits contract's `SplitError` enum. */
+/**
+ * Stable identifiers for the splits contract's `SplitError` enum. They share
+ * the numeric-code space of the `splits` contract, so they are listed
+ * separately from {@link StreamErrorCode}; the SDK currently maps stream
+ * contract failures onto {@link StreamsError.code}, and these names are what a
+ * caller should compare decoded `splits` diagnostics against.
+ *
+ * @example
+ * ```typescript
+ * import type { SplitErrorCode } from '@stellar-starter-kit/sdk';
+ *
+ * const isRecipientsProblem = (code: SplitErrorCode) =>
+ *   code === 'EmptyRecipients' || code === 'LengthMismatch' || code === 'DuplicateRecipient';
+ * ```
+ */
 export type SplitErrorCode =
   | 'EmptyRecipients'
   | 'LengthMismatch'
@@ -254,6 +363,26 @@ const STREAM_ERROR_CODES: Record<number, StreamErrorCode> = {
  * that survives contract redeploys; `contractCode` is the raw numeric code.
  * Both are undefined when the failure is not a known contract error, in which
  * case `message` carries the raw diagnostics.
+ *
+ * Thrown by every {@link StreamsClient} method that reaches the contract:
+ * reads from the pre-flight simulation, writes from the simulation *and* from
+ * submission / confirmation polling.
+ *
+ * @example
+ * ```typescript
+ * import { StreamsError } from '@stellar-starter-kit/sdk';
+ *
+ * try {
+ *   await client.withdraw(streamId);
+ * } catch (error) {
+ *   if (error instanceof StreamsError) {
+ *     error.name;          // 'StreamsError'
+ *     error.code;          // e.g. 'NOTHING_TO_WITHDRAW', or undefined
+ *     error.contractCode;  // e.g. 5 — the raw `StreamError` enum value
+ *     error.message;       // includes the contract diagnostics
+ *   }
+ * }
+ * ```
  */
 export class StreamsError extends Error {
   /** Stable identifier for the contract error, e.g. `STREAM_NOT_FOUND`. */
@@ -261,6 +390,19 @@ export class StreamsError extends Error {
   /** The raw numeric code from the contract's `StreamError` enum. */
   readonly contractCode?: number;
 
+  /**
+   * @param message - Human-readable failure text, always including the raw
+   *   simulation or submission diagnostics.
+   * @param contractCode - Numeric `StreamError` value decoded from those
+   *   diagnostics; omit it when the failure is not a contract error.
+   * @example
+   * ```typescript
+   * const known = new StreamsError('Simulation of withdraw failed: Error(Contract, #5)', 5);
+   * known.code; // 'NOTHING_TO_WITHDRAW'
+   * const unknown = new StreamsError('Simulation of get_stream failed: HostError(sceBuiltin)');
+   * unknown.code; // undefined — the message stays untouched
+   * ```
+   */
   constructor(message: string, contractCode?: number) {
     super(message);
     this.name = 'StreamsError';
@@ -364,6 +506,21 @@ abstract class SorobanClient {
    */
   private account: Promise<Account> | null = null;
 
+  /**
+   * @param options - Endpoint, contract id, network and (for writes) the
+   *   connected account plus its signer. See {@link StreamsClientOptions}.
+   * @example
+   * ```typescript
+   * // Read-only client: safe to construct during SSR without a wallet.
+   * const publicClient = new StreamsClient({
+   *   contractId,
+   *   rpcUrl: 'https://soroban-testnet.stellar.org',
+   *   networkPassphrase: 'Test SDF Network ; September 2015',
+   *   publicKey: serviceAccountPublicKey,
+   * });
+   * await publicClient.getConfig();
+   * ```
+   */
   constructor(options: StreamsClientOptions) {
     this.options = options;
     this.transport = options.transport ?? new SorobanRpc.Server(options.rpcUrl);
@@ -384,7 +541,17 @@ abstract class SorobanClient {
     return new Contract(this.options.contractId);
   }
 
-  /** The configured contract id. */
+  /**
+   * The configured contract id.
+   *
+   * @returns The `stream` contract id (`C...`) the client was constructed with.
+   * @example
+   * ```typescript
+   * if (client.contractId !== expectedContractId) {
+   *   throw new Error('Client is pointed at the wrong deployment.');
+   * }
+   * ```
+   */
   get contractId(): string {
     return this.options.contractId;
   }
@@ -416,6 +583,15 @@ abstract class SorobanClient {
    * Drops the cached source account so the next call re-fetches it. Called
    * automatically after every submitted write (its sequence number has been
    * consumed); call it yourself if the account is used from elsewhere.
+   *
+   * @returns Nothing.
+   * @example
+   * ```typescript
+   * // The source account also transacts outside this client, so its cached
+   * // sequence number may be stale before the next write.
+   * client.invalidateAccount();
+   * await client.withdraw(streamId);
+   * ```
    */
   invalidateAccount(): void {
     this.account = null;
@@ -655,10 +831,29 @@ abstract class SorobanClient {
 /**
  * A typed client for the Stellar Streams protocol. Read calls simulate against
  * Soroban RPC. Write calls are simulated first — aborting with a readable
- * `StreamsError` before any wallet prompt when the contract would reject them
- * — then prepared, signed by the injected wallet signer, submitted, and polled
- * to completion. Write calls accept an `AbortSignal` that cancels the wallet
- * prompt, the submission and the confirmation poll.
+ * {@link StreamsError} before any wallet prompt when the contract would reject
+ * them — then prepared, signed by the injected wallet signer, submitted, and
+ * polled to completion. Write calls accept an `AbortSignal` that cancels the
+ * wallet prompt, the submission and the confirmation poll.
+ *
+ * One client per (contract, network) pair is enough: the source account and
+ * each token's metadata are cached on the instance, and concurrent reads share
+ * a single `getAccount` round trip.
+ * @example
+ * ```typescript
+ * import { StreamsClient, assetContractId } from '@stellar-starter-kit/sdk';
+ *
+ * const client = new StreamsClient({
+ *   contractId: process.env.NEXT_PUBLIC_STREAM_CONTRACT_ID!,
+ *   rpcUrl: 'https://soroban-testnet.stellar.org',
+ *   networkPassphrase: 'Test SDF Network ; September 2015',
+ *   publicKey: address,
+ *   signTransaction: (txXdr) => wallet.signTransaction(txXdr),
+ * });
+ *
+ * const stream = await client.getStream(1n);
+ * const claimable = stream ? await client.claimable(stream.id) : 0n;
+ * ```
  */
 export class StreamsClient extends SorobanClient {
   protected readonly errorCodes = STREAM_ERROR_CODES;
@@ -670,7 +865,21 @@ export class StreamsClient extends SorobanClient {
   /** Token metadata never changes for a deployed contract, so cache it per id. */
   private readonly tokens = new Map<string, Promise<TokenMetadata>>();
 
-  /** Fetch a stream by id. Returns `null` if it does not exist. */
+  /**
+   * Fetch a stream by id, decoded from the contract's `Stream` struct into the
+   * camelCase `Stream` shape (`u64`/`i128` fields arrive as decimal strings).
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @returns The stream, or `null` when no stream with that id exists.
+   * @throws StreamsError when the simulation fails with a contract error.
+   * @example
+   * ```typescript
+   * const stream = await client.getStream(12);
+   * if (stream) {
+   *   console.log(stream.recipient, stream.totalAmount, stream.cancelled);
+   * }
+   * ```
+   */
   async getStream(id: bigint | number | string): Promise<Stream | null> {
     const raw = (await this.simulate(
       'get_stream',
@@ -679,24 +888,77 @@ export class StreamsClient extends SorobanClient {
     return raw ? normalizeStream(raw) : null;
   }
 
-  /** Fetch protocol configuration. Returns `null` if the contract is uninitialized. */
+  /**
+   * Fetch protocol configuration: who can set the treasury and the protocol fee.
+   *
+   * @returns The admin, treasury and `feeBps`, or `null` when the contract has
+   *   not been initialized yet.
+   * @throws StreamsError when the simulation fails with a contract error.
+   * @example
+   * ```typescript
+   * const config = await client.getConfig();
+   * if (!config) console.warn('Deploy the contract, then call initialize().');
+   * else console.log(`Fee: ${config.feeBps / 100}% (admin ${config.admin})`);
+   * ```
+   */
   async getConfig(): Promise<StreamConfig | null> {
     const raw = (await this.simulate('get_config')) as RawConfig | null;
     if (!raw) return null;
     return { admin: raw.admin, treasury: raw.treasury, feeBps: Number(raw.fee_bps) };
   }
 
-  /** Currently withdrawable amount for a stream, in the token's smallest unit. */
+  /**
+   * Currently withdrawable amount for a stream, in the token's smallest unit.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @returns Vested-but-unclaimed amount; `0n` before the cliff or once
+   *   everything has been withdrawn.
+   * @throws StreamsError when the simulation fails with a contract error, e.g.
+   *   `STREAM_NOT_FOUND` (contract error `#4`) for an unknown id.
+   * @example
+   * ```typescript
+   * import { formatTokenAmount } from '@stellar-starter-kit/utils';
+   *
+   * const { decimals } = await client.getTokenMetadata(stream.token);
+   * const claimable = await client.claimable(stream.id);
+   * console.log(`${formatTokenAmount(claimable, decimals)} withdrawable now`);
+   * ```
+   */
   async claimable(id: bigint | number | string): Promise<bigint> {
     return (await this.simulate('claimable', nativeToScVal(BigInt(id), { type: 'u64' }))) as bigint;
   }
 
-  /** Total amount vested so far, in the token's smallest unit. */
+  /**
+   * Total amount vested so far, in the token's smallest unit — including what
+   * has already been withdrawn.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @returns Vested amount; equals the total once `endTime` has passed.
+   * @throws StreamsError when the simulation fails with a contract error, e.g.
+   *   `STREAM_NOT_FOUND` (contract error `#4`) for an unknown id.
+   * @example
+   * ```typescript
+   * const vested = await client.vested(stream.id);
+   * const progress = Number(vested) / Number(stream.totalAmount); // 0…1
+   * ```
+   */
   async vested(id: bigint | number | string): Promise<bigint> {
     return (await this.simulate('vested', nativeToScVal(BigInt(id), { type: 'u64' }))) as bigint;
   }
 
-  /** The id the next stream will receive. */
+  /**
+   * The id the next stream will receive.
+   *
+   * @returns The pending stream id, starting at `1n` on a fresh deployment.
+   * @throws StreamsError when the simulation fails with a contract error.
+   * @example
+   * ```typescript
+   * const nextId = await client.nextStreamId();
+   * const { hash } = await client.createStream(params);
+   * // `nextId` is the id this write consumed, so the stream can be read back:
+   * const created = await client.getStream(nextId);
+   * ```
+   */
   async nextStreamId(): Promise<bigint> {
     return (await this.simulate('next_stream_id')) as bigint;
   }
@@ -795,8 +1057,23 @@ export class StreamsClient extends SorobanClient {
 
   /**
    * Reads `decimals` and `symbol` from a token contract. Works for any SEP-41
-   * token: the native XLM SAC, an issued asset's SAC (see `assetContractId`),
+   * token: the native XLM SAC, an issued asset's SAC (see {@link assetContractId}),
    * or a custom Soroban token. Results are cached per contract id.
+   *
+   * @param tokenId - Token contract id (`C...`).
+   * @returns The token's `contractId`, `decimals` and `symbol`.
+   * @throws Error when `tokenId` is not a valid `C...` contract address —
+   *   before any network call.
+   * @throws StreamsError when the token does not implement SEP-41 `decimals`
+   *   or `symbol`.
+   * @example
+   * ```typescript
+   * import { parseTokenAmount } from '@stellar-starter-kit/utils';
+   *
+   * const token = assetContractId('native', 'Test SDF Network ; September 2015');
+   * const { decimals, symbol } = await client.getTokenMetadata(token); // 7, 'XLM'
+   * const amount = parseTokenAmount('100', decimals).toString();       // '1000000000'
+   * ```
    */
   async getTokenMetadata(tokenId: string): Promise<TokenMetadata> {
     assertTokenId(tokenId);
@@ -820,13 +1097,52 @@ export class StreamsClient extends SorobanClient {
   /**
    * Lock tokens and open a new stream. `params.token` may be any token
    * contract id; `params.amount` is in that token's smallest unit, so scale it
-   * by the token's own `decimals` (see `getTokenMetadata`), not by 7.
+   * by the token's own `decimals` (see {@link getTokenMetadata}), not by 7.
    *
    * Inputs are validated before the transaction is built: an invalid address,
    * a non-positive amount, an inconsistent schedule or oversized metadata
    * throws a field-named error without spending a network round trip or a
    * wallet signature. `params.label` and `params.reference` default to no
    * metadata (empty strings).
+   *
+   * @param params - Sender, recipient, token, amount in the token's smallest
+   *   unit, the `startTime`/`endTime`/`cliffTime` schedule (Unix seconds), and
+   *   optional `label` (64 bytes) / `reference` (128 bytes) metadata.
+   * @returns The hash of the confirmed transaction; resolve the new stream id
+   *   with {@link nextStreamId} before the call or by reading events after it.
+   * @throws Error when a field is invalid — `sender`/`recipient` are not
+   *   `G...`/`C...` addresses, `token` is not a `C...` address, `amount` is not
+   *   a positive decimal integer string, `endTime <= startTime`, `cliffTime` is
+   *   outside the schedule, or the metadata is too long.
+   * @throws Error when no `publicKey` / `signTransaction` was configured.
+   * @throws StreamsError when the pre-flight simulation or the submitted
+   *   transaction is rejected by the contract — e.g. `INVALID_AMOUNT`,
+   *   `INVALID_TIME_RANGE`, `INVALID_CLIFF` or `METADATA_TOO_LONG`. The whole
+   *   `amount` is pulled from `sender` with the token's own `transfer`, so a
+   *   token that refuses the move fails the call too.
+   * @example
+   * ```typescript
+   * import { assetContractId } from '@stellar-starter-kit/sdk';
+   * import { parseTokenAmount } from '@stellar-starter-kit/utils';
+   *
+   * const now = Math.floor(Date.now() / 1_000);
+   * const token = assetContractId('native', 'Test SDF Network ; September 2015');
+   * const { decimals } = await client.getTokenMetadata(token);
+   *
+   * // 100 XLM vesting linearly over 30 days, no cliff.
+   * const { hash } = await client.createStream({
+   *   sender: address,
+   *   recipient,
+   *   token,
+   *   amount: parseTokenAmount('100', decimals).toString(),
+   *   startTime: now,
+   *   endTime: now + 30 * 86_400,
+   *   cliffTime: now,
+   *   label: 'Payroll Q3',
+   *   reference: 'INV-2026-07',
+   * });
+   * console.log(`stream funded in ${hash}`);
+   * ```
    */
   async createStream(
     params: CreateStreamParams,
@@ -857,12 +1173,54 @@ export class StreamsClient extends SorobanClient {
     );
   }
 
-  /** Withdraw the vested balance of a stream to its recipient. */
+  /**
+   * Withdraw the vested balance of a stream to its recipient. Only the
+   * recipient's own key (or contract) can authorize it.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @param opts - per-call write options; `opts.signal` aborts the prompt, submission and poll.
+   * @returns `{ hash }` of the confirmed transaction; the amount actually
+   *   transferred (vested minus the protocol fee) is not surfaced by the SDK,
+   *   so read the stream again to see the new `withdrawn` total.
+   * @throws Error when no `publicKey` / `signTransaction` was configured.
+   * @throws StreamsError when the contract rejects the call — `STREAM_NOT_FOUND`,
+   *   `NOTHING_TO_WITHDRAW` (before the cliff or when fully withdrawn), or
+   *   `TREASURY_NOT_SET` when a fee is configured without a treasury.
+   * @example
+   * ```typescript
+   * try {
+   *   const { hash } = await client.withdraw(stream.id);
+   *   console.log(`withdrawn in ${hash}`);
+   * } catch (error) {
+   *   if (error instanceof StreamsError && error.code === 'NOTHING_TO_WITHDRAW') {
+   *     console.log(`vested from ${new Date(stream.cliffTime * 1_000)}`);
+   *   }
+   * }
+   * ```
+   */
   async withdraw(id: bigint | number | string, opts: WriteOptions = {}): Promise<{ hash: string }> {
     return this.invoke('withdraw', [nativeToScVal(BigInt(id), { type: 'u64' })], opts);
   }
 
-  /** Cancel a stream, refunding the unvested balance to the sender. */
+  /**
+   * Cancel a stream, refunding the unvested balance to the sender. Only the
+   * sender can authorize it, and cancelling twice is an error rather than a
+   * no-op.
+   *
+   * @param id - Stream id as `bigint`, `number`, or decimal string.
+   * @param opts - per-call write options; `opts.signal` aborts the prompt, submission and poll.
+   * @returns The hash of the confirmed transaction; the stream keeps
+   *   `cancelled: true` and the recipient can still withdraw what vested.
+   * @throws Error when no `publicKey` / `signTransaction` was configured.
+   * @throws StreamsError when the contract rejects the call — `STREAM_NOT_FOUND`
+   *   or `ALREADY_CANCELLED`.
+   * @example
+   * ```typescript
+   * const { hash } = await client.cancel(stream.id);
+   * const cancelled = await client.getStream(stream.id);
+   * console.log(cancelled?.cancelled === true); // true
+   * ```
+   */
   async cancel(id: bigint | number | string, opts: WriteOptions = {}): Promise<{ hash: string }> {
     return this.invoke('cancel', [nativeToScVal(BigInt(id), { type: 'u64' })], opts);
   }
@@ -964,83 +1322,10 @@ export class EscrowClient extends SorobanClient {
   }
 }
 
-interface RawStream {
-  id: bigint;
-  sender: string;
-  recipient: string;
-  token: string;
-  total_amount: bigint;
-  withdrawn: bigint;
-  start_time: bigint;
-  end_time: bigint;
-  cliff_time: bigint;
-  label: string;
-  reference: string;
-  cancelled: boolean;
-}
-
 interface RawConfig {
   admin: string;
   treasury: string;
   fee_bps: number;
-}
-
-interface RawEscrow {
-  id: bigint;
-  payer: string;
-  payee: string;
-  arbiter: string;
-  token: string;
-  amount: bigint;
-  deadline: bigint;
-  status: number;
-}
-
-function normalizeStream(raw: RawStream): Stream {
-  return {
-    id: raw.id.toString(),
-    sender: raw.sender,
-    recipient: raw.recipient,
-    token: raw.token,
-    totalAmount: raw.total_amount.toString(),
-    withdrawn: raw.withdrawn.toString(),
-    startTime: Number(raw.start_time),
-    endTime: Number(raw.end_time),
-    cliffTime: Number(raw.cliff_time),
-    label: raw.label,
-    reference: raw.reference,
-    cancelled: raw.cancelled,
-  };
-}
-
-function normalizeEscrow(raw: RawEscrow): Escrow {
-  return {
-    id: raw.id.toString(),
-    payer: raw.payer,
-    payee: raw.payee,
-    arbiter: raw.arbiter,
-    token: raw.token,
-    amount: raw.amount.toString(),
-    deadline: Number(raw.deadline),
-    status: escrowStatusFromIndex(Number(raw.status)),
-  };
-}
-
-/** Maps the escrow contract's numeric status discriminant to its name, in enum order. */
-const ESCROW_STATUSES: readonly EscrowStatus[] = [
-  'created',
-  'funded',
-  'released',
-  'refunded',
-  'cancelled',
-];
-
-function escrowStatusFromIndex(index: number): EscrowStatus {
-  const status = ESCROW_STATUSES[index];
-  if (!status) {
-    throw new Error(`Unknown escrow status index: ${index}`);
-  }
-  return status;
 }
 
 function assertTokenId(tokenId: string): void {
